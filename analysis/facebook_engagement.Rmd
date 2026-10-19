@@ -1,0 +1,169 @@
+---
+title: "Facebook Post Engagement: Timing and Paid Promotion"
+author: "STOR 320 Group 6 — portfolio adaptation"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+## Project overview
+
+This analysis explores two questions using 500 Facebook posts from a cosmetics brand: (1) how does engagement vary with posting time and content type, and (2) how does paid promotion relate to engagement? Engagement is measured by **Total Interactions** (likes + comments + shares). These observational data cannot establish causal effects or advertising return on investment.
+
+## Setup and data preparation
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(broom)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+set.seed(320)
+# Render from the repository root, e.g. rmarkdown::render("analysis/facebook_engagement.Rmd")
+posts <- readr::read_delim("data/facebook_posts.csv", delim = ";", show_col_types = FALSE) %>%
+  transmute(
+    type = factor(Type),
+    month = factor(`Post Month`, levels = 1:12, labels = month.abb),
+    weekday = factor(`Post Weekday`, levels = 1:7,
+                     labels = c("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")),
+    hour = as.integer(`Post Hour`),
+    paid = factor(Paid, levels = c(0, 1), labels = c("Organic", "Paid")),
+    reach = as.numeric(`Lifetime Post Total Reach`),
+    interactions = as.numeric(`Total Interactions`)
+  )
+knitr::kable(posts %>% count(type), caption = "Posts by content type")
+summary(posts$interactions)
+```
+
+The data contain 500 posts; some promotion values are missing. Model-specific missing observations are omitted explicitly below. Weekday codes use Sunday = 1, Saturday = 7. Hour is recorded in 24-hour time.
+
+## Exploratory analysis
+
+```{r engagement-by-type, fig.width=8, fig.height=4}
+ggplot(posts, aes(type, interactions)) +
+  geom_boxplot(outlier.alpha = 0.25) +
+  coord_cartesian(ylim = c(0, quantile(posts$interactions, .95, na.rm = TRUE))) +
+  labs(title = "Distribution of interactions by post type", x = "Post type", y = "Total interactions (view limited to 95th percentile)") +
+  theme_minimal()
+```
+
+The next heatmap is descriptive, not a prediction. To reduce the visual impact of extreme posts, it excludes observations above the 95th percentile; this changes the population being summarized. Sparse day-hour-type combinations can produce unstable averages.
+
+```{r heatmap, fig.width=10, fig.height=6}
+heatmap_data <- posts %>%
+  filter(interactions <= quantile(interactions, .95, na.rm = TRUE)) %>%
+  group_by(type, weekday, hour) %>%
+  summarise(mean_interactions = mean(interactions), n = n(), .groups = "drop")
+ggplot(heatmap_data, aes(hour, weekday, fill = mean_interactions)) +
+  geom_tile(color = "white") + facet_wrap(~type) +
+  scale_fill_viridis_c() +
+  labs(title = "Average interactions by posting time and type", subtitle = "Top 5% of posts excluded; cells may contain few posts", x = "Hour (24-hour clock)", y = "Day", fill = "Mean interactions") + theme_minimal()
+```
+
+## Comparing timing models
+
+We compare eight linear regression specifications. Unlike the original classroom draft, the error measures below use a held-out test set instead of the same observations used to fit the models. The test set is only a basic check; a larger independent dataset would provide stronger evidence of generalization. The model with hour-by-day interaction can be unstable when combinations are rare, so hour is treated as numeric in these models.
+
+```{r model-comparison}
+model_data <- posts %>% drop_na(interactions, hour, weekday, month)
+train_ids <- sample(seq_len(nrow(model_data)), size = floor(.8 * nrow(model_data)))
+train <- model_data[train_ids, ]
+test <- model_data[-train_ids, ]
+formulas <- list(
+  "Hour" = interactions ~ hour,
+  "Weekday" = interactions ~ weekday,
+  "Month" = interactions ~ month,
+  "Hour + weekday" = interactions ~ hour + weekday,
+  "Hour + month" = interactions ~ hour + month,
+  "Weekday + month" = interactions ~ weekday + month,
+  "All timing variables" = interactions ~ hour + weekday + month,
+  "Hour × weekday + month" = interactions ~ hour * weekday + month
+)
+metrics <- purrr::imap_dfr(formulas, function(formula, name) {
+  fit <- lm(formula, data = train)
+  prediction <- predict(fit, newdata = test)
+  tibble(model = name, MAE = mean(abs(test$interactions - prediction)),
+         MSE = mean((test$interactions - prediction)^2),
+         RMSE = sqrt(MSE))
+}) %>% arrange(MAE)
+knitr::kable(metrics, digits = 2, caption = "Holdout prediction errors (lower is better)")
+```
+
+MAE is the average absolute prediction error; MSE is the average squared error. MSE penalizes unusually large errors more strongly. Lower training error alone does not prove a more complex model predicts better.
+
+## Probability of high engagement
+
+High engagement is defined as total interactions at or above the **training-set** 75th percentile. This definition avoids choosing the threshold using test outcomes. The model estimates associations, not guaranteed optimal posting times.
+
+```{r logistic-model, fig.width=8, fig.height=5}
+cutoff <- quantile(train$interactions, .75)
+train <- train %>% mutate(high_engagement = as.integer(interactions >= cutoff))
+test <- test %>% mutate(high_engagement = as.integer(interactions >= cutoff))
+logit <- glm(high_engagement ~ hour + weekday + month, data = train, family = binomial())
+prob <- predict(logit, newdata = test, type = "response")
+knitr::kable(tibble(
+  threshold = cutoff,
+  test_brier_score = mean((test$high_engagement - prob)^2),
+  baseline_brier_score = mean((test$high_engagement - mean(train$high_engagement))^2)
+), digits = 3, caption = "Test-set Brier score (lower is better)")
+new_times <- expand_grid(hour = sort(unique(posts$hour)),
+                         weekday = levels(posts$weekday),
+                         month = levels(posts$month)) %>%
+  mutate(weekday = factor(weekday, levels = levels(posts$weekday)),
+         month = factor(month, levels = levels(posts$month)),
+         probability = predict(logit, newdata = ., type = "response"))
+ggplot(new_times, aes(hour, weekday, fill = probability)) +
+  geom_tile() + facet_wrap(~month, ncol = 4) +
+  scale_fill_viridis_c(limits = c(0, 1)) +
+  labs(title = "Modeled probability of high engagement", x = "Hour", y = "Day", fill = "Probability") + theme_minimal()
+```
+
+## Paid promotion and post type
+
+```{r paid-comparison, fig.width=9, fig.height=5}
+paid_data <- posts %>% drop_na(paid, interactions)
+paid_summary <- paid_data %>% group_by(type, paid) %>%
+  summarise(n = n(), mean_interactions = mean(interactions),
+            median_interactions = median(interactions), .groups = "drop")
+knitr::kable(paid_summary, digits = 1, caption = "Observed engagement by content and promotion")
+ggplot(paid_summary, aes(type, mean_interactions, fill = paid)) +
+  geom_col(position = "dodge") +
+  labs(title = "Average interactions: paid vs. organic", x = "Content type", y = "Mean interactions", fill = "Promotion") + theme_minimal()
+```
+
+```{r paid-regression}
+paid_fit <- lm(interactions ~ paid * type + hour, data = paid_data)
+knitr::kable(broom::tidy(paid_fit), digits = 3,
+             caption = "Exploratory regression with promotion-by-type interactions")
+```
+
+The coefficients describe adjusted associations under this specification. A non-significant coefficient is not proof of no effect, and individual interaction coefficients depend on the reference category. The model does not account for all potential confounders.
+
+## Reach and interactions
+
+Reach and interactions are both post-performance outcomes. Their association **cannot** identify diminishing returns to advertising spend because the dataset contains no spending amounts. The quadratic fit below is descriptive.
+
+```{r reach-model, fig.width=8, fig.height=5}
+reach_data <- posts %>% drop_na(reach, interactions)
+reach_fit <- lm(interactions ~ reach + I(reach^2), data = reach_data)
+knitr::kable(broom::tidy(reach_fit), digits = 5)
+ggplot(reach_data, aes(reach, interactions)) +
+  geom_point(alpha = .3) +
+  geom_smooth(method = "lm", formula = y ~ x + I(x^2), se = TRUE) +
+  labs(title = "Association between post reach and interactions",
+       subtitle = "Quadratic trend; not an estimate of advertising ROI",
+       x = "Lifetime reach", y = "Total interactions") + theme_minimal()
+```
+
+## Conclusions and limitations
+
+- Engagement varies substantially across content types and individual posts; descriptive averages for sparse posting-time cells should be interpreted cautiously.
+- Compare the holdout errors and logistic model's Brier score before claiming that posting-time variables predict engagement reliably.
+- Paid and organic posts differ in observed engagement, but the dataset does not support causal claims about paid promotion.
+- Without promotion costs, it is not possible to estimate return on ad spend or an optimal advertising budget.
+- Results come from a single brand and historical posts; generalization to other brands, platforms, or years is uncertain.
+
+**Possible next steps:** repeated cross-validation, uncertainty intervals for subgroup averages, richer features, and access to ad spend and targeting data.
+
+## Data source
+
+Moro, Rita, and Vala (2016), *Facebook metrics* dataset, UCI Machine Learning Repository. See the repository README for source and attribution.
