@@ -56,6 +56,3 @@ facebook-engagement-analysis/
 
 Source: [UCI Machine Learning Repository — Facebook Metrics](https://archive.ics.uci.edu/dataset/368/facebook+metrics). Originally associated with Moro, Rita, and Vala (2016). Dataset redistributed here for reproducibility; consult the source for metadata and usage terms.
 
-## Project background
-
-Adapted and refactored from a collaborative STOR 320 course project (Group 6). The cleaned analysis preserves the original research questions while correcting code and making methodological limitations explicit.
